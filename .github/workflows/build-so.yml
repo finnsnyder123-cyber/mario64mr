@@ -1,0 +1,43 @@
+name: Build all .so files
+on: workflow_dispatch
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: nttld/setup-ndk@v1
+        id: ndk
+        with:
+          ndk-version: r26d
+      - name: Build everything
+        env:
+          NDK: ${{ steps.ndk.outputs.ndk-path }}
+        run: |
+          set -u
+          ABIS="arm64-v8a"; API=29; OUT="$PWD/so_out"; mkdir -p "$OUT"
+          touch /tmp/mark; sleep 1
+          # Android.mk modules
+          find . -path "*/jni/Android.mk" | while read f; do d=$(dirname "$(dirname "$f")"); echo "== $d";
+            "$NDK/ndk-build" -C "$d" -j4 APP_ABI="$ABIS" APP_PLATFORM=android-$API NDK_DEBUG=0 || echo "FAILED $d"; done
+          # CMake modules (skip ones inside another module)
+          TOP=""
+          for f in $(find . -name CMakeLists.txt -not -path "*/.git/*" | sort); do
+            d=$(dirname "$f"); skip=0
+            for t in $TOP; do case "$d/" in "$t"/*) skip=1;; esac; done
+            [ $skip = 1 ] && continue; TOP="$TOP $d"
+            for abi in $ABIS; do
+              cmake -S "$d" -B "$d/build-$abi" -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake" -DANDROID_ABI=$abi -DANDROID_PLATFORM=android-$API -DCMAKE_BUILD_TYPE=Release \
+                && cmake --build "$d/build-$abi" -j4 || echo "FAILED $d ($abi)"
+            done
+          done
+          # gather every .so made during this run
+          find . -name "*.so" -newer /tmp/mark -not -path "*/CMakeFiles/*" -not -path "./so_out/*" | while read f; do
+            dest="$OUT/$(basename "$(dirname "$f")")"; mkdir -p "$dest"; cp -f "$f" "$dest/"; done
+          find "$OUT" -name "*.so" | sort
+          test -n "$(find "$OUT" -name "*.so")" || { echo "No .so files were made"; exit 1; }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: so-files
+          path: so_out
