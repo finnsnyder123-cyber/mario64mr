@@ -1,0 +1,62 @@
+name: Build all .so files
+on: workflow_dispatch
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: nttld/setup-ndk@v1
+        id: ndk
+        with:
+          ndk-version: r26d
+      - name: Build everything
+        env:
+          NDK: ${{ steps.ndk.outputs.ndk-path }}
+        run: |
+          set +e
+          mkdir -p so_out; OUT="$PWD/so_out"; ABIS="arm64-v8a"; API=29
+          {
+          echo "=== What is in this project ==="
+          find . -maxdepth 5 \( -name Android.mk -o -name Application.mk -o -name CMakeLists.txt -o -name Makefile -o -name "build.gradle*" -o -name gradlew -o -name "*.so" \) -not -path "./.git/*" | sort | head -150
+          touch /tmp/mark; sleep 1
+          tops(){ TOP=""; while read -r f; do d=$(dirname "$f"); s=0; for t in $TOP; do case "$d/" in "$t"/*) s=1;; esac; done; if [ $s = 0 ]; then TOP="$TOP $d"; echo "$d"; fi; done; }
+          echo "=== Android.mk modules ==="
+          for d in $(find . -name Android.mk -not -path "./.git/*" | sort | tops); do
+            echo "-- $d"
+            "$NDK/ndk-build" NDK_PROJECT_PATH="$d" APP_BUILD_SCRIPT="$d/Android.mk" APP_ABI="$ABIS" APP_PLATFORM=android-$API NDK_OUT="$d/obj" NDK_LIBS_OUT="$d/libs-out" -j4 || echo "FAILED $d"
+          done
+          echo "=== CMake modules ==="
+          for d in $(find . -name CMakeLists.txt -not -path "./.git/*" | sort | tops); do
+            for abi in $ABIS; do
+              echo "-- $d ($abi)"
+              cmake -S "$d" -B "$d/build-$abi" -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake" -DANDROID_ABI=$abi -DANDROID_PLATFORM=android-$API -DCMAKE_BUILD_TYPE=Release \
+                && cmake --build "$d/build-$abi" -j4 || echo "FAILED $d ($abi)"
+            done
+          done
+          echo "=== Gradle projects ==="
+          for g in $(find . -name gradlew -not -path "./.git/*" | sort); do
+            d=$(dirname "$g"); echo "-- $d"
+            (cd "$d" && chmod +x gradlew && { ./gradlew assembleRelease --no-daemon || ./gradlew assembleDebug --no-daemon; }) || echo "FAILED $d"
+          done
+          echo "=== Collecting files ==="
+          find . -name "*.so" -newer /tmp/mark -not -path "*/CMakeFiles/*" -not -path "./so_out/*" | while read -r f; do
+            dest="$OUT/$(basename "$(dirname "$f")")"; mkdir -p "$dest"; cp -f "$f" "$dest/"; done
+          for a in $(find . -name "*.apk" -newer /tmp/mark -not -path "./so_out/*"); do unzip -o -q "$a" "lib/*" -d "$OUT/from_$(basename "$a" .apk)"; done
+          echo "=== Result ==="; find "$OUT" -name "*.so" | sort
+          } 2>&1 | tee build-log.txt
+          exit 0
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: so-files
+          path: |
+            so_out
+            build-log.txt
+      - name: Check that files were made
+        run: test -n "$(find so_out -name '*.so' 2>/dev/null)"
